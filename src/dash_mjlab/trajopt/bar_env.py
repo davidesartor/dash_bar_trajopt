@@ -1,11 +1,11 @@
 """Trajectory-optimization evaluation environment for the bar-angle task.
 
 Not an RL environment. This is a deterministic black-box cost evaluator: a
-collaborator hands over four functions of time -- one desired-position
-trajectory per joint of the right arm -- and gets back a scalar cost, the
-angular distance between where the bar was asked to point and where it points
-when the clock runs out. Same functions in, same cost out, every time: plain
-single-threaded MuJoCo on CPU, no randomization, no torch.
+collaborator hands over one vectorized control law -- times in, desired joint
+positions for the right arm out -- and gets back a scalar cost, the angular
+distance between where the bar was asked to point and where it points when the
+clock runs out. Same law in, same cost out, every time: plain single-threaded
+MuJoCo on CPU, no randomization, no torch.
 
 The scene is the same robot and bar as the RL task ``Mjlab-Bar-Angle-Dash-
 UpperBody`` (the specs are shared, not copied), minus the RL stack: a
@@ -13,31 +13,37 @@ horizontal bar on a vertical hinge in front of the robot. Gravity has no
 torque about the hinge, so the bar stays wherever it is pushed, less what the
 joint damping bleeds off.
 
-Only the right arm is driven. The four trajectories map to, in order:
+Only the right arm is driven. The law's output columns map to, in order:
 
   0  r_shoulder_pitch
   1  r_shoulder_roll
   2  r_shoulder_yaw
   3  r_elbow_pitch
 
-each taking the time in seconds (0 <= t < horizon) and returning the desired
-joint position in radians (clamped to the joint's range). Tracking is a plain
-PD torque law, kp * (desired - q) - kd * qd, clamped to the 30 Nm effort
-limit. The default kp = 20 is deliberately soft -- gravity sags the shoulder
-visibly below its commanded position -- so the trajectories have to reason
-about dynamics, not just kinematics. The left arm is PD-held at the spawn pose
-with the stiff gains the RL task trains with; it never reaches the bar.
+It takes times in seconds (0 <= t < horizon) with a trailing axis of size one
+and returns desired joint positions in radians, clamped to each joint's range.
+The batch axes are the caller's: the env may query the whole horizon in one
+call or one step at a time (see ``precompute``), and a properly vectorized law
+cannot tell the difference.
+
+Tracking is a plain PD torque law, kp * (desired - q) - kd * qd, clamped to
+the 30 Nm effort limit. The default kp = 20 is deliberately soft -- gravity
+sags the shoulder visibly below its commanded position -- so the trajectories
+have to reason about dynamics, not just kinematics. The left arm is PD-held at
+the spawn pose with the stiff gains the RL task trains with; it never reaches
+the bar.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import mujoco
 import numpy as np
+from jaxtyping import Float
 
 if TYPE_CHECKING:
   from mjviser import ViserMujocoScene
@@ -54,7 +60,7 @@ from dash_mjlab.tasks.bar_angle.env_cfgs import (
   get_bar_spec,
 )
 
-JointTrajectory = Callable[[float], float]
+ControlLaw = Callable[[Float[np.ndarray, "... 1"]], Float[np.ndarray, "... 4"]]
 
 ACTIVE_JOINTS: tuple[str, ...] = (
   "r_shoulder_pitch",
@@ -89,9 +95,9 @@ _SPAWN_POSE = {
   "elbow_pitch": -0.4,
 }
 assert ARMS_READY_KEYFRAME.joint_pos is not None  # Keep the two poses in sync.
-assert _SPAWN_POSE["shoulder_pitch"] == ARMS_READY_KEYFRAME.joint_pos[
-  ".*_shoulder_pitch"
-]
+assert (
+  _SPAWN_POSE["shoulder_pitch"] == ARMS_READY_KEYFRAME.joint_pos[".*_shoulder_pitch"]
+)
 assert _SPAWN_POSE["elbow_pitch"] == ARMS_READY_KEYFRAME.joint_pos[".*_elbow_pitch"]
 
 
@@ -167,15 +173,21 @@ def _build_model(timestep: float) -> mujoco.MjModel:
 
 
 class BarAngleTrajOptEnv:
-  """Deterministic rollout evaluator for joint-trajectory candidates.
+  """Deterministic rollout evaluator for control-law candidates.
 
-  Typical use::
+  The control law maps times in seconds, shape ``(..., 1)``, to desired right-
+  arm joint positions in radians, shape ``(..., 4)``, columns in the order
+  ``ACTIVE_JOINTS``: r_shoulder_pitch, r_shoulder_roll, r_shoulder_yaw,
+  r_elbow_pitch. Typical use::
+
+    def control_law(t):  # (..., 1) -> (..., 4)
+      return np.concatenate(
+        [shoulder_pitch(t), shoulder_roll(t), shoulder_yaw(t), elbow_pitch(t)],
+        axis=-1,
+      )
 
     env = BarAngleTrajOptEnv()
-    cost = env.evaluate(
-      [f_shoulder_pitch, f_shoulder_roll, f_shoulder_yaw, f_elbow_pitch],
-      target_angle=0.6,
-    )
+    cost = env.evaluate(control_law, target_angle=0.6)
 
   One instance can evaluate any number of candidates; each ``evaluate`` starts
   from the identical initial state. The instance is not thread-safe (it owns a
@@ -256,6 +268,22 @@ class BarAngleTrajOptEnv:
     ]
     mujoco.mj_forward(self.model, self.data)
 
+  def _query(
+    self, control_law: ControlLaw, times: Float[np.ndarray, " M"]
+  ) -> Float[np.ndarray, "M 4"]:
+    """Desired joint positions at `times`, validated and clamped to range."""
+    desired = np.asarray(control_law(times[:, None]), dtype=float)
+    expected = (len(times), len(ACTIVE_JOINTS))
+    if desired.shape != expected:
+      raise ValueError(
+        f"Control law given times of shape {times[:, None].shape} must return "
+        f"shape {expected} ({', '.join(ACTIVE_JOINTS)}), got {desired.shape}."
+      )
+    if not np.isfinite(desired).all():
+      bad = times[~np.isfinite(desired).all(axis=-1)][0]
+      raise ValueError(f"Control law returned a non-finite value at t={bad:.3f}.")
+    return np.clip(desired, self._active_range[:, 0], self._active_range[:, 1])
+
   def _get_viser_scene(self) -> ViserMujocoScene:
     if self._viser_scene is None:
       import viser
@@ -269,9 +297,10 @@ class BarAngleTrajOptEnv:
 
   def evaluate(
     self,
-    joint_trajectories: Sequence[JointTrajectory],
+    control_law: ControlLaw,
     target_angle: float,
     *,
+    precompute: bool = True,
     return_trajectory: bool = False,
     render: bool = False,
     render_backend: Literal["viser", "native"] = "viser",
@@ -279,13 +308,18 @@ class BarAngleTrajOptEnv:
     video_fps: int = 30,
     video_size: tuple[int, int] = (480, 640),
   ) -> float | tuple[float, dict[str, np.ndarray]]:
-    """Roll out the four joint trajectories and return the terminal cost.
+    """Roll out the control law and return the terminal cost.
 
     Args:
-      joint_trajectories: four callables, one per joint in ``ACTIVE_JOINTS``
-        order, each mapping time in seconds to desired joint position in rad.
-        Values outside the joint's range are clamped, non-finite values raise.
+      control_law: vectorized map from times (shape ``(..., 1)``, seconds) to
+        desired joint positions (shape ``(..., 4)``, rad) in ``ACTIVE_JOINTS``
+        order. Values outside a joint's range are clamped, non-finite raise.
       target_angle: commanded bar angle in rad.
+      precompute: query the law once for the whole horizon before stepping.
+        The law is a function of time alone, so this is equivalent to asking
+        it step by step and saves ``num_steps - 1`` calls. Set False to have
+        it queried one step at a time, which is what a state-dependent law
+        would need.
       return_trajectory: also return the full rollout -- keys ``time``,
         ``bar_angle``, ``joint_pos``, ``joint_target`` -- for debugging a
         candidate. Off by default so the search loop pays nothing for it.
@@ -308,17 +342,13 @@ class BarAngleTrajOptEnv:
       angle|, in radians. With ``return_trajectory``, a ``(cost, trajectory)``
       tuple instead.
     """
-    if len(joint_trajectories) != len(ACTIVE_JOINTS):
-      raise ValueError(
-        f"Expected {len(ACTIVE_JOINTS)} joint trajectories "
-        f"({', '.join(ACTIVE_JOINTS)}), got {len(joint_trajectories)}."
-      )
     self._reset(target_angle)
 
     n = self.num_steps
     # Always allocated: a few float arrays per rollout are noise next to the
     # physics, and it keeps every variable unconditionally bound.
     times = np.arange(n) * self.timestep
+    schedule = self._query(control_law, times) if precompute else None
     bar_angles = np.empty(n)
     joint_pos = np.empty((n, 4))
     joint_target = np.empty((n, 4))
@@ -352,11 +382,11 @@ class BarAngleTrajOptEnv:
 
     try:
       for k in range(n):
-        t = k * self.timestep
-        desired = np.array([f(t) for f in joint_trajectories], dtype=float)
-        if not np.isfinite(desired).all():
-          raise ValueError(f"Joint trajectory returned non-finite value at t={t:.3f}.")
-        desired = np.clip(desired, self._active_range[:, 0], self._active_range[:, 1])
+        t = times[k]
+        if schedule is not None:
+          desired = schedule[k]
+        else:
+          desired = self._query(control_law, times[k : k + 1])[0]
 
         q = self.data.qpos[self._active_qadr]
         qd = self.data.qvel[self._active_vadr]

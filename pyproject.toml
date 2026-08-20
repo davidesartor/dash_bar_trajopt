@@ -9,6 +9,7 @@ description = "Dash humanoid robot tasks for mjlab."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10,<3.14"
 dependencies = [
+  "jaxtyping>=0.3.7",
   "mjlab @ git+https://github.com/mujocolab/mjlab@v1.5.3",
 ]
 
@@ -71,6 +72,8 @@ exclude = ["typings"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
+# jaxtyping's shape strings are annotations ruff cannot parse as Python.
+ignore = ["F722"]
 
 [tool.pyright]
 pythonVersion = "3.10"

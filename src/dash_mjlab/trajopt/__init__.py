@@ -3,11 +3,11 @@
 from dash_mjlab.trajopt.bar_env import (
   ACTIVE_JOINTS,
   BarAngleTrajOptEnv,
-  JointTrajectory,
+  ControlLaw,
 )
 
 __all__ = [
   "ACTIVE_JOINTS",
   "BarAngleTrajOptEnv",
-  "JointTrajectory",
+  "ControlLaw",
 ]

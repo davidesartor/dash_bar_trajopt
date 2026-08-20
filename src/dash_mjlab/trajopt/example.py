@@ -5,9 +5,10 @@ Run from the repo root::
   uv run python -m dash_mjlab.trajopt.example            # print costs
   uv run python -m dash_mjlab.trajopt.example --render   # watch the push
 
-The interface a trajectory-optimization method has to satisfy is just: four
-callables, time in seconds -> desired joint position in rad, one per joint of
-the right arm (shoulder pitch, shoulder roll, shoulder yaw, elbow pitch).
+The interface a trajectory-optimization method has to satisfy is just: one
+vectorized callable, times in seconds (shape ``(..., 1)``) -> desired joint
+positions in rad (shape ``(..., 4)``), the columns being the right arm's
+shoulder pitch, shoulder roll, shoulder yaw and elbow pitch.
 
 The push shown here was found by exactly the kind of search this environment
 exists to serve -- random search over a two-phase smoothstep parameterization,
@@ -19,6 +20,7 @@ against a target of -0.5, where doing nothing scores 0.5.
 import argparse
 
 import numpy as np
+from jaxtyping import Float
 
 from dash_mjlab.trajopt import BarAngleTrajOptEnv
 
@@ -33,24 +35,22 @@ T_A, D_A = 0.71, 0.52  # phase A start time and duration (s)
 T_B, D_B = 2.42, 1.77  # phase B start time and duration (s)
 
 
-def _smoothstep(a: float) -> float:
-  a = min(max(a, 0.0), 1.0)
+def _smoothstep(a: Float[np.ndarray, "..."]) -> Float[np.ndarray, "..."]:
+  a = np.clip(a, 0.0, 1.0)
   return 3 * a**2 - 2 * a**3
 
 
-def make_two_phase_push():
-  """The four joint trajectories: spawn -> POSE_A -> POSE_B, smoothstepped."""
+def two_phase_push(t: Float[np.ndarray, "... 1"]) -> Float[np.ndarray, "... 4"]:
+  """Spawn -> POSE_A -> POSE_B, smoothstepped. The trailing axis broadcasts
+  the time against the four joints."""
+  a1 = _smoothstep((t - T_A) / D_A)
+  a2 = _smoothstep((t - T_B) / D_B)
+  return SPAWN + a1 * (POSE_A - SPAWN) + a2 * (POSE_B - POSE_A)
 
-  def fn(j: int):
-    def f(t: float) -> float:
-      a1 = _smoothstep((t - T_A) / D_A)
-      a2 = _smoothstep((t - T_B) / D_B)
-      p = SPAWN[j] + a1 * (POSE_A[j] - SPAWN[j])
-      return p + a2 * (POSE_B[j] - POSE_A[j])
 
-    return f
-
-  return [fn(j) for j in range(4)]
+def hold_spawn(t: Float[np.ndarray, "... 1"]) -> Float[np.ndarray, "... 4"]:
+  """The do-nothing baseline: sit at the spawn pose for the whole horizon."""
+  return np.broadcast_to(SPAWN, (*t.shape[:-1], SPAWN.size))
 
 
 def main() -> None:
@@ -75,12 +75,11 @@ def main() -> None:
 
   env = BarAngleTrajOptEnv()
 
-  hold = [lambda t, j=j: SPAWN[j] for j in range(4)]
   print(f"target angle: {TARGET_ANGLE} rad")
-  print(f"hold-spawn-pose cost: {env.evaluate(hold, TARGET_ANGLE):.4f} rad")
+  print(f"hold-spawn-pose cost: {env.evaluate(hold_spawn, TARGET_ANGLE):.4f} rad")
 
   cost = env.evaluate(
-    make_two_phase_push(),
+    two_phase_push,
     TARGET_ANGLE,
     render=args.render,
     render_backend=args.backend,

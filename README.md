@@ -5,9 +5,9 @@ horizontal bar sits on a vertical revolute joint in front of the robot, so it
 can only swing in the horizontal plane and gravity never moves it. The goal is
 to make the bar point at a commanded angle by pushing it with the right arm.
 
-You provide four joint-position trajectories (plain Python functions of time),
-the simulator rolls them out with PD control, and you get back a scalar cost.
-Deterministic: the same trajectories always produce the same cost.
+You provide one vectorized control law (times in, desired joint positions out),
+the simulator rolls it out with PD control, and you get back a scalar cost.
+Deterministic: the same law always produces the same cost.
 
 ## Setup
 
@@ -24,16 +24,19 @@ from dash_mjlab.trajopt import BarAngleTrajOptEnv
 
 env = BarAngleTrajOptEnv()          # horizon=5.0 s, kp=20, kd=1, dt=0.005 s
 
-cost = env.evaluate(
-  [f_shoulder_pitch, f_shoulder_roll, f_shoulder_yaw, f_elbow_pitch],
-  target_angle=0.6,                 # rad
-)
+cost = env.evaluate(control_law, target_angle=0.6)   # rad
 ```
 
-- Each `f(t)` maps time in seconds (`0 <= t < horizon`) to a desired joint
-  position in radians. Values outside the joint's range are clamped;
-  non-finite values raise.
-- The four functions drive the right arm, in this order:
+- `control_law` maps times in seconds (`0 <= t < horizon`, shape `(..., 1)`) to
+  desired joint positions in radians (shape `(..., 4)`). Values outside a
+  joint's range are clamped; non-finite values raise. It must be vectorized
+  over the leading axes -- returning the wrong shape is an error, not a
+  silently broadcast constant.
+- By default the law is queried once for the whole horizon before stepping.
+  Pass `precompute=False` to have it queried one step at a time instead; for a
+  law that is a function of time alone the two are equivalent, and the costs
+  agree exactly.
+- The four output columns drive the right arm, in this order:
   `r_shoulder_pitch`, `r_shoulder_roll`, `r_shoulder_yaw`, `r_elbow_pitch`
   (ranges: `[-0.6, 1.1]`, `[-0.6, 0.3]`, `[-0.8, 0.8]`, `[-1.5, 0]`).
   The left arm is held at its spawn pose and never reaches the bar.
@@ -52,12 +55,12 @@ evaluations but not thread-safe; create one per worker for parallel search.
 ### Debugging a candidate
 
 ```python
-cost, traj = env.evaluate(fns, target_angle=0.6, return_trajectory=True)
+cost, traj = env.evaluate(control_law, target_angle=0.6, return_trajectory=True)
 # traj["time"], traj["bar_angle"], traj["joint_pos"], traj["joint_target"]
 
-cost = env.evaluate(fns, target_angle=0.6, render=True)   # watch it live
+cost = env.evaluate(control_law, target_angle=0.6, render=True)   # watch it live
 
-cost = env.evaluate(fns, target_angle=0.6, video_path="push.mp4")  # save video
+cost = env.evaluate(control_law, target_angle=0.6, video_path="push.mp4")
 ```
 
 Video capture is offscreen (no window, works headless and at full speed);
