@@ -1,8 +1,8 @@
 """Trajectory-optimization evaluation environment for the bar-angle task.
 
 Not an RL environment. This is a deterministic black-box cost evaluator: a
-collaborator hands over one vectorized control law -- times in, desired joint
-positions for the right arm out -- and gets back a scalar cost, the angular
+collaborator hands over one vectorized control law -- phase in, right-arm
+joint targets out -- and gets back a scalar cost, the angular
 distance between where the bar was asked to point and where it points when the
 clock runs out. Same law in, same cost out, every time: plain single-threaded
 MuJoCo on CPU, no randomization, no torch.
@@ -20,8 +20,13 @@ Only the right arm is driven. The law's output columns map to, in order:
   2  r_shoulder_yaw
   3  r_elbow_pitch
 
-It takes times in seconds (0 <= t < horizon) with a trailing axis of size one
-and returns desired joint positions in radians, clamped to each joint's range.
+The law works in normalized units, so a search never has to know the robot:
+it takes a phase in [0, 1) (the fraction of the horizon elapsed) with a
+trailing axis of size one, and returns four numbers in [-1, 1]. The env
+decodes those into radians -- 0 holds the spawn pose, +-1 reaches the joint's
+upper/lower limit -- so the do-nothing law is the zero function and the
+reachable set is exactly the cube. Values outside it are clipped.
+
 The batch axes are the caller's: the env may query the whole horizon in one
 call or one step at a time (see ``precompute``), and a properly vectorized law
 cannot tell the difference.
@@ -175,14 +180,15 @@ def _build_model(timestep: float) -> mujoco.MjModel:
 class BarAngleTrajOptEnv:
   """Deterministic rollout evaluator for control-law candidates.
 
-  The control law maps times in seconds, shape ``(..., 1)``, to desired right-
-  arm joint positions in radians, shape ``(..., 4)``, columns in the order
+  The control law maps phase in [0, 1), shape ``(..., 1)``, to normalized
+  right-arm joint targets in [-1, 1], shape ``(..., 4)``, columns in the order
   ``ACTIVE_JOINTS``: r_shoulder_pitch, r_shoulder_roll, r_shoulder_yaw,
-  r_elbow_pitch. Typical use::
+  r_elbow_pitch. Zero holds the spawn pose; the env decodes to radians and
+  clips. Typical use::
 
-    def control_law(t):  # (..., 1) -> (..., 4)
+    def control_law(s):  # (..., 1) -> (..., 4)
       return np.concatenate(
-        [shoulder_pitch(t), shoulder_roll(t), shoulder_yaw(t), elbow_pitch(t)],
+        [shoulder_pitch(s), shoulder_roll(s), shoulder_yaw(s), elbow_pitch(s)],
         axis=-1,
       )
 
@@ -268,21 +274,32 @@ class BarAngleTrajOptEnv:
     ]
     mujoco.mj_forward(self.model, self.data)
 
+  def _decode(self, action: Float[np.ndarray, "M 4"]) -> Float[np.ndarray, "M 4"]:
+    """Normalized joint targets in [-1, 1] -> radians: 0 is the spawn pose,
+    +-1 the joint's upper/lower limit. Piecewise linear, since the spawn pose
+    is not centred in its range."""
+    action = np.clip(action, -1.0, 1.0)
+    reach_up = self._active_range[:, 1] - self._active_spawn
+    reach_down = self._active_spawn - self._active_range[:, 0]
+    return self._active_spawn + action * np.where(action >= 0.0, reach_up, reach_down)
+
   def _query(
     self, control_law: ControlLaw, times: Float[np.ndarray, " M"]
   ) -> Float[np.ndarray, "M 4"]:
-    """Desired joint positions at `times`, validated and clamped to range."""
-    desired = np.asarray(control_law(times[:, None]), dtype=float)
+    """Desired joint positions (rad) at `times`, decoded from the law's
+    normalized output."""
+    phases = times[:, None] / self.horizon
+    action = np.asarray(control_law(phases), dtype=float)
     expected = (len(times), len(ACTIVE_JOINTS))
-    if desired.shape != expected:
+    if action.shape != expected:
       raise ValueError(
-        f"Control law given times of shape {times[:, None].shape} must return "
-        f"shape {expected} ({', '.join(ACTIVE_JOINTS)}), got {desired.shape}."
+        f"Control law given phases of shape {phases.shape} must return "
+        f"shape {expected} ({', '.join(ACTIVE_JOINTS)}), got {action.shape}."
       )
-    if not np.isfinite(desired).all():
-      bad = times[~np.isfinite(desired).all(axis=-1)][0]
-      raise ValueError(f"Control law returned a non-finite value at t={bad:.3f}.")
-    return np.clip(desired, self._active_range[:, 0], self._active_range[:, 1])
+    if not np.isfinite(action).all():
+      bad = phases[~np.isfinite(action).all(axis=-1)][0, 0]
+      raise ValueError(f"Control law returned a non-finite value at phase {bad:.3f}.")
+    return self._decode(action)
 
   def _get_viser_scene(self) -> ViserMujocoScene:
     if self._viser_scene is None:
@@ -311,9 +328,10 @@ class BarAngleTrajOptEnv:
     """Roll out the control law and return the terminal cost.
 
     Args:
-      control_law: vectorized map from times (shape ``(..., 1)``, seconds) to
-        desired joint positions (shape ``(..., 4)``, rad) in ``ACTIVE_JOINTS``
-        order. Values outside a joint's range are clamped, non-finite raise.
+      control_law: vectorized map from phase (shape ``(..., 1)``, 0 to 1) to
+        normalized joint targets (shape ``(..., 4)``, -1 to 1) in
+        ``ACTIVE_JOINTS`` order. Zero holds the spawn pose, +-1 is the joint's
+        limit; values outside the cube are clipped, non-finite raise.
       target_angle: commanded bar angle in rad.
       precompute: query the law once for the whole horizon before stepping.
         The law is a function of time alone, so this is equivalent to asking

@@ -6,9 +6,10 @@ Run from the repo root::
   uv run python -m dash_mjlab.trajopt.example --render   # watch the push
 
 The interface a trajectory-optimization method has to satisfy is just: one
-vectorized callable, times in seconds (shape ``(..., 1)``) -> desired joint
-positions in rad (shape ``(..., 4)``), the columns being the right arm's
-shoulder pitch, shoulder roll, shoulder yaw and elbow pitch.
+vectorized callable, phase in [0, 1) (shape ``(..., 1)``) -> normalized joint
+targets in [-1, 1] (shape ``(..., 4)``), the columns being the right arm's
+shoulder pitch, shoulder roll, shoulder yaw and elbow pitch. Zero is the spawn
+pose, so no radians and no joint limits ever reach the optimizer.
 
 The push shown here was found by exactly the kind of search this environment
 exists to serve -- random search over a two-phase smoothstep parameterization,
@@ -24,15 +25,14 @@ from jaxtyping import Float
 
 from dash_mjlab.trajopt import BarAngleTrajOptEnv
 
-SPAWN = np.array([-0.3, 0.0, 0.0, -0.4])
-
 TARGET_ANGLE = -0.5
-# Insert: reach in past the bar, elbow straight, yaw swept inward.
-POSE_A = np.array([-0.6, 0.3, 0.8, 0.0])
+# Insert: reach in past the bar, elbow straight, yaw swept inward. Every joint
+# is pinned against a limit, hence the exact +-1.
+POSE_A = np.array([-1.0, 1.0, 1.0, 1.0])
 # Sweep: pull back out, rolling and yawing outward -- the bar rides along.
-POSE_B = np.array([-0.219, -0.589, -0.005, -1.4])
-T_A, D_A = 0.71, 0.52  # phase A start time and duration (s)
-T_B, D_B = 2.42, 1.77  # phase B start time and duration (s)
+POSE_B = np.array([0.0578571, -0.9816667, -0.00625, -0.9090909])
+S_A, W_A = 0.142, 0.104  # phase A start and duration, as fractions of horizon
+S_B, W_B = 0.484, 0.354  # phase B start and duration
 
 
 def _smoothstep(a: Float[np.ndarray, "..."]) -> Float[np.ndarray, "..."]:
@@ -40,17 +40,17 @@ def _smoothstep(a: Float[np.ndarray, "..."]) -> Float[np.ndarray, "..."]:
   return 3 * a**2 - 2 * a**3
 
 
-def two_phase_push(t: Float[np.ndarray, "... 1"]) -> Float[np.ndarray, "... 4"]:
+def two_phase_push(s: Float[np.ndarray, "... 1"]) -> Float[np.ndarray, "... 4"]:
   """Spawn -> POSE_A -> POSE_B, smoothstepped. The trailing axis broadcasts
-  the time against the four joints."""
-  a1 = _smoothstep((t - T_A) / D_A)
-  a2 = _smoothstep((t - T_B) / D_B)
-  return SPAWN + a1 * (POSE_A - SPAWN) + a2 * (POSE_B - POSE_A)
+  the phase against the four joints."""
+  a1 = _smoothstep((s - S_A) / W_A)
+  a2 = _smoothstep((s - S_B) / W_B)
+  return a1 * POSE_A + a2 * (POSE_B - POSE_A)
 
 
-def hold_spawn(t: Float[np.ndarray, "... 1"]) -> Float[np.ndarray, "... 4"]:
-  """The do-nothing baseline: sit at the spawn pose for the whole horizon."""
-  return np.broadcast_to(SPAWN, (*t.shape[:-1], SPAWN.size))
+def hold_spawn(s: Float[np.ndarray, "... 1"]) -> Float[np.ndarray, "... 4"]:
+  """The do-nothing baseline: the zero function already is the spawn pose."""
+  return np.zeros((*s.shape[:-1], 4))
 
 
 def main() -> None:
